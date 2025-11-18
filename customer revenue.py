@@ -1,13 +1,12 @@
 # ============================================
-# Customer Revenue & Churn Intelligence Pipeline
+# Customer Revenue & Churn Intelligence Functions
 # ============================================
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import tomli
-from pymongo import MongoClient
+
 
 # --------------------------------------------
 # 1. LOAD & INSPECT DATA
@@ -32,14 +31,19 @@ def clean_data(df):
     # Remove duplicates
     df = df.drop_duplicates()
 
-    # Handle missing values
+    # Fix dates
     if "transaction_date" in df.columns:
         df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
-    df["amount"] = df["amount"].fillna(0)
 
-    # Fill missing names/emails with placeholders
-    df["customer_name"] = df.get("customer_name", "").fillna("Unknown").str.strip()
-    df["email"] = df.get("email", "").fillna("unknown@example.com").str.strip().str.lower()
+    # Amount handling
+    if "amount" in df.columns:
+        df["amount"] = df["amount"].fillna(0).astype(float)
+
+    # Name handling
+    df["customer_name"] = df.get("customer_name", pd.Series(["Unknown"] * len(df))).fillna("Unknown")
+
+    # Email handling
+    df["email"] = df.get("email", pd.Series(["unknown@example.com"] * len(df))).fillna("unknown@example.com")
 
     return df
 
@@ -48,15 +52,16 @@ def clean_data(df):
 # 3. TRANSFORM THE DATA
 # --------------------------------------------
 def transform_data(df, customer_profile_file=None):
-    # String manipulations
-    df["customer_name"] = df["customer_name"].str.title().str.strip()
-    df["city"] = df["city"].str.title()
+    # String cleanup
+    df["customer_name"] = df["customer_name"].astype(str).str.title().str.strip()
 
-    # Create new features
+    if "city" in df.columns:
+        df["city"] = df["city"].astype(str).str.title()
+
+    # Create features
     df["transaction_month"] = df["transaction_date"].dt.to_period("M")
-    df["amount"] = df["amount"].astype(float)
 
-    # Merge with customer profile dataset if provided
+    # Optional merging
     if customer_profile_file:
         profile_df = pd.read_csv(customer_profile_file)
         profile_df.columns = profile_df.columns.str.lower().str.replace(" ", "_")
@@ -69,32 +74,31 @@ def transform_data(df, customer_profile_file=None):
 # 4. CHURN + SEGMENTATION
 # --------------------------------------------
 def apply_churn_and_segmentation(df):
-    # ---- Churn Logic ----
-    # Customer is churned if last purchase was > 90 days ago
     last_date = df["transaction_date"].max()
     churn_threshold = last_date - pd.Timedelta(days=90)
 
+    # Churn logic
     cust_last_purchase = df.groupby("customer_id")["transaction_date"].max()
     churn_df = pd.DataFrame(cust_last_purchase)
     churn_df["is_churned"] = churn_df["transaction_date"] < churn_threshold
 
     df = df.merge(churn_df["is_churned"], on="customer_id", how="left")
 
-    # ---- RFM Segmentation ----
+    # RFM logic
     rfm = df.groupby("customer_id").agg({
-        "transaction_date": lambda x: (last_date - x.max()).days,  # Recency
-        "transaction_id": "count",                               # Frequency
-        "amount": "sum"                                          # Monetary
+        "transaction_date": lambda x: (last_date - x.max()).days,
+        "transaction_id": "count" if "transaction_id" in df.columns else "size",
+        "amount": "sum"
     }).rename(columns={
         "transaction_date": "recency",
         "transaction_id": "frequency",
         "amount": "monetary"
     })
 
-    # Quantile-based segmentation
-    rfm["R"] = pd.qcut(rfm["recency"], 3, labels=[3, 2, 1])
-    rfm["F"] = pd.qcut(rfm["frequency"], 3, labels=[1, 2, 3])
-    rfm["M"] = pd.qcut(rfm["monetary"], 3, labels=[1, 2, 3])
+    # Ranking safe mode
+    rfm["R"] = pd.qcut(rfm["recency"].rank(method="first"), 3, labels=[3, 2, 1])
+    rfm["F"] = pd.qcut(rfm["frequency"].rank(method="first"), 3, labels=[1, 2, 3])
+    rfm["M"] = pd.qcut(rfm["monetary"].rank(method="first"), 3, labels=[1, 2, 3])
 
     rfm["segment"] = rfm["R"].astype(str) + rfm["F"].astype(str) + rfm["M"].astype(str)
 
@@ -109,10 +113,9 @@ def apply_churn_and_segmentation(df):
 def create_pivots(df):
     monthly_revenue = df.pivot_table(
         index="transaction_month",
-        columns="segment",
         values="amount",
         aggfunc="sum"
-    ).fillna(0)
+    )
 
     melted = df.melt(
         id_vars=["customer_id", "segment"],
@@ -128,17 +131,22 @@ def create_pivots(df):
 # 6. VISUALIZATION
 # --------------------------------------------
 def visualize_data(df, rfm):
+    sns.set_style("whitegrid")
+
+    # Churn chart
     plt.figure(figsize=(8, 4))
     sns.countplot(data=df.drop_duplicates("customer_id"), x="is_churned")
     plt.title("Churn Distribution")
     plt.show()
 
-    plt.figure(figsize=(8, 4))
+    # Segmentation chart
+    plt.figure(figsize=(10, 4))
     sns.countplot(data=df.drop_duplicates("customer_id"), x="segment")
     plt.title("Customer Segmentation (RFM)")
+    plt.xticks(rotation=45)
     plt.show()
 
-    # Revenue trend
+    # Monthly revenue
     rev = df.groupby("transaction_month")["amount"].sum()
     plt.figure(figsize=(10, 5))
     rev.plot(kind="line")
@@ -148,46 +156,27 @@ def visualize_data(df, rfm):
 
 
 # --------------------------------------------
-# 7. UPLOAD TO MONGODB
+# 7. MAIN EXECUTION PIPELINE (your file added)
 # --------------------------------------------
-def upload_to_mongo(df, config_file="mongo_config.toml"):
-    with open(config_file, "rb") as f:
-        cfg = tomli.load(f)
-
-    host = cfg["mongo"]["host"]
-    port = cfg["mongo"]["port"]
-    user = cfg["mongo"]["username"]
-    password = cfg["mongo"]["password"]
-    dbname = cfg["mongo"]["database"]
-    collection_name = cfg["mongo"]["collection"]
-
-    uri = f"mongodb://{user}:{password}@{host}:{port}/"
-
-    client = MongoClient(uri)
-    db = client[dbname]
-    collection = db[collection_name]
-
-    records = df.to_dict("records")
-    collection.insert_many(records)
-
-    print("Upload complete.")
-
-
-# ============================================
-# MAIN PIPELINE
-# ============================================
 if __name__ == "__main__":
+    file_path = "/mnt/data/project1-retail-raw-dataset.csv.xlsx"
 
-    df = load_data("customer_transactions.csv")
+    print("Loading data...")
+    df = load_data(file_path)
 
+    print("\nCleaning data...")
     df = clean_data(df)
 
-    df = transform_data(df, customer_profile_file="customer_profiles.csv")  # Optional
+    print("\nTransforming data...")
+    df = transform_data(df)
 
+    print("\nApplying churn and segmentation...")
     df, rfm = apply_churn_and_segmentation(df)
 
-    monthly_pivot, melted_data = create_pivots(df)
+    print("\nCreating pivots...")
+    monthly_revenue, melted = create_pivots(df)
 
+    print("\nVisualizing results...")
     visualize_data(df, rfm)
 
-    upload_to_mongo(df)
+    print("\nPipeline Complete!")
